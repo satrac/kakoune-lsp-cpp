@@ -3,9 +3,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 
-#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -14,20 +14,27 @@ namespace klsp
 
 std::vector<std::string> split_command(const std::string& command)
 {
+    return parse_shell_words(command);
+}
+
+// Parse a shell-ish word list: single/double quotes, backslash escapes,
+// and adjacent-quote concatenation ("a'b c'd" -> "ab cd").
+std::vector<std::string> parse_shell_words(const std::string& text)
+{
     std::vector<std::string> out;
     std::string current;
     bool in_arg = false;
     char quote = 0;
 
-    for (size_t i = 0; i < command.size(); ++i)
+    for (size_t i = 0; i < text.size(); ++i)
     {
-        char c = command[i];
+        char c = text[i];
         if (quote)
         {
             if (c == quote)
                 quote = 0;
-            else if (c == '\\' && quote == '"' and i + 1 < command.size())
-                current += command[++i];
+            else if (c == '\\' and quote == '"' and i + 1 < text.size())
+                current += text[++i];
             else
                 current += c;
         }
@@ -56,6 +63,20 @@ std::vector<std::string> split_command(const std::string& command)
     return out;
 }
 
+std::string shell_quote(const std::string& text)
+{
+    std::string out = "'";
+    for (char c : text)
+    {
+        if (c == '\'')
+            out += "'\\''";
+        else
+            out += c;
+    }
+    out += "'";
+    return out;
+}
+
 std::string to_file_uri(const std::string& path)
 {
     static const char* hex = "0123456789abcdef";
@@ -74,15 +95,6 @@ std::string to_file_uri(const std::string& path)
     return uri;
 }
 
-static void close_fd(int& fd)
-{
-    if (fd >= 0)
-    {
-        ::close(fd);
-        fd = -1;
-    }
-}
-
 Server::Server(std::vector<std::string> argv, const std::string& cwd)
 {
     if (argv.empty())
@@ -99,7 +111,6 @@ Server::Server(std::vector<std::string> argv, const std::string& cwd)
 
     if (m_pid == 0)
     {
-        // Child: wire stdin/stdout to the pipes.
         ::dup2(to_child[0], STDIN_FILENO);
         ::dup2(from_child[1], STDOUT_FILENO);
         ::close(to_child[0]);
@@ -118,22 +129,28 @@ Server::Server(std::vector<std::string> argv, const std::string& cwd)
         ::_exit(127);
     }
 
-    // Parent.
     ::close(to_child[0]);
     ::close(from_child[1]);
     m_to_server = to_child[1];
     m_from_server = from_child[0];
+
+    m_reader = std::thread([this] { reader_loop(); });
 }
 
 Server::~Server()
 {
-    close_fd(m_to_server);
-    close_fd(m_from_server);
-    close_fd(m_err);
+    if (m_to_server >= 0)
+        ::close(m_to_server);
+    m_to_server = -1;
+    if (m_from_server >= 0)
+        ::close(m_from_server);
+    m_from_server = -1;
+    if (m_reader.joinable())
+        m_reader.join();
     if (m_pid > 0)
     {
         int status = 0;
-        ::waitpid(m_pid, &status, WNOHANG);
+        ::waitpid(m_pid, &status, 0);
     }
 }
 
@@ -153,6 +170,9 @@ void Server::send_message(const json& msg)
 {
     std::string body = msg.dump();
     std::string header = "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+    std::lock_guard<std::mutex> lock{m_write_mutex};
+    if (m_to_server < 0)
+        return;
     write_all(header.data(), header.size());
     write_all(body.data(), body.size());
 }
@@ -174,7 +194,6 @@ std::string Server::read_exact(size_t size)
 
 json Server::read_message()
 {
-    // Read headers up to the blank line.
     std::string headers;
     for (;;)
     {
@@ -205,6 +224,42 @@ json Server::read_message()
     return json::parse(read_exact(length));
 }
 
+void Server::reader_loop()
+{
+    try
+    {
+        for (;;)
+        {
+            json msg = read_message();
+            std::lock_guard<std::mutex> lock{m_state_mutex};
+            if (msg.contains("method"))
+            {
+                if (msg.contains("id") and not msg["id"].is_null())
+                {
+                    // Server -> client request; answer null so it does not block.
+                    json reply = {{"jsonrpc", "2.0"}, {"id", msg["id"]}, {"result", nullptr}};
+                    send_message(reply);
+                }
+                else
+                    m_notifications.push_back(std::move(msg));
+            }
+            else if (msg.contains("id") and msg["id"].is_number_integer())
+            {
+                int id = msg["id"].get<int>();
+                m_responses[id] = std::move(msg);
+                m_cv.notify_all();
+            }
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::lock_guard<std::mutex> lock{m_state_mutex};
+        m_closed = true;
+        m_cv.notify_all();
+        std::cerr << "[klsp] server reader stopped: " << e.what() << "\n";
+    }
+}
+
 void Server::notify(const std::string& method, const json& params)
 {
     send_message({{"jsonrpc", "2.0"}, {"method", method}, {"params", params}});
@@ -212,26 +267,32 @@ void Server::notify(const std::string& method, const json& params)
 
 json Server::request(const std::string& method, const json& params)
 {
-    int id = ++m_next_id;
+    int id;
+    {
+        std::lock_guard<std::mutex> lock{m_state_mutex};
+        id = ++m_next_id;
+    }
     send_message({{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}});
 
-    for (;;)
-    {
-        json msg = read_message();
-        if (msg.contains("method"))
-        {
-            // Server -> client request: answer with null so it does not block.
-            if (msg.contains("id"))
-                send_message({{"jsonrpc", "2.0"}, {"id", msg["id"]}, {"result", nullptr}});
-            continue;
-        }
-        if (msg.value("id", -1) == id)
-        {
-            if (msg.contains("error"))
-                throw std::runtime_error("LSP error: " + msg["error"].dump());
-            return msg.value("result", json());
-        }
-    }
+    std::unique_lock<std::mutex> lock{m_state_mutex};
+    m_cv.wait(lock, [&] { return m_responses.count(id) > 0 or m_closed; });
+    if (m_responses.count(id) == 0)
+        throw std::runtime_error("language server closed during request");
+    json msg = std::move(m_responses[id]);
+    m_responses.erase(id);
+    lock.unlock();
+
+    if (msg.contains("error"))
+        throw std::runtime_error("LSP error: " + msg["error"].dump());
+    return msg.value("result", json());
+}
+
+std::vector<json> Server::drain_notifications()
+{
+    std::lock_guard<std::mutex> lock{m_state_mutex};
+    std::vector<json> out;
+    out.swap(m_notifications);
+    return out;
 }
 
 } // namespace klsp

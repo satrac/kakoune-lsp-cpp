@@ -11,17 +11,21 @@ language — there is no per-language code.
 
 ## Status
 
-Early, but the core works:
+Early, but usable:
 
 - [x] LSP transport over stdio (`Content-Length` framing, `nlohmann/json`)
-- [x] Language server subprocess management
+- [x] Language server subprocess management (threaded reader)
 - [x] `initialize` / `initialized` / `shutdown` handshake
-- [x] `textDocument/didOpen`, `textDocument/hover`
-- [ ] `--daemon` mode + Kakoune FIFO integration (`rc/kakoune-lsp-cpp.kak`)
-- [ ] `didChange` + `publishDiagnostics`
-- [ ] go-to-definition, references, rename, formatting, completion
+- [x] `--daemon` mode + Kakoune integration (`rc/kakoune-lsp-cpp.kak`)
+- [x] `didOpen` / `didChange` (full sync) and `publishDiagnostics`
+- [x] `textDocument/hover` and `textDocument/definition`, `textDocument/references`
+- [ ] rename, formatting, completion, code actions, document symbols
 
-The `--probe` mode is a working end-to-end smoke test against a real server:
+Verified end-to-end against `clangd`: opening a C++ buffer syncs the document,
+diagnostics are shown on the status line, `:lsp-hover` shows real hover docs,
+and `:lsp-definition` jumps to the definition.
+
+The `--probe` mode is a standalone smoke test against any server:
 
 ```sh
 cmake -S . -B build
@@ -31,6 +35,21 @@ cmake --build build -j
 # initialize serverInfo: {"name":"clangd", ...}
 # hover: {"contents": { ... "int add(int a, int b)" ... }}
 ```
+
+### Using it in Kakoune
+
+1. Install the binary (`sudo cmake --install build`).
+2. Drop `rc/kakoune-lsp-cpp.kak` into `~/.config/kak/autoload/`, or `source` it
+   from `kakrc`.
+3. Open a supported file: LSP auto-enables for `c`, `cpp`, `objc`, `rust`,
+   `go`, `python` and `lua`.
+
+Commands: `:lsp-enable`, `:lsp-disable`, `:lsp-hover`, `:lsp-definition`,
+`:lsp-references`, `:lsp-stop`.
+
+The filetype → server mapping lives in `src/daemon.cc` (defaults: `clangd`,
+`rust-analyzer`, `gopls`, `pylsp`, `lua-language-server`). Set the `klsp_cmd`
+option if the binary is not on `PATH`.
 
 ## Design
 

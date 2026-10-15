@@ -1,3 +1,4 @@
+#include "daemon.hh"
 #include "json.hh"
 #include "lsp.hh"
 
@@ -20,7 +21,7 @@ static const char* USAGE =
     "kakoune-lsp-cpp " KLSP_VERSION "\n"
     "\n"
     "Usage:\n"
-    "  kakoune-lsp-cpp --daemon --session <name> [--server <cmd>]   run the LSP daemon\n"
+    "  kakoune-lsp-cpp --daemon --session <name> --fifo <path> [--debug]   run the LSP daemon\n"
     "  kakoune-lsp-cpp --probe  --server <cmd> [--file <path>] [--line N --col N]\n"
     "                                                            one-shot LSP handshake test\n"
     "  kakoune-lsp-cpp --version | --help\n";
@@ -114,9 +115,10 @@ static int run_probe(const std::string& server_cmd, const std::string& file,
 
 int main(int argc, char** argv)
 {
-    std::string session, server_cmd, file;
+    std::string session, server_cmd, file, fifo;
     int line = 0, col = 0;
     bool probe = false;
+    bool debug = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -133,8 +135,10 @@ int main(int argc, char** argv)
         else if (arg == "--help" or arg == "-h") { std::cout << USAGE; return 0; }
         else if (arg == "--probe") probe = true;
         else if (arg == "--daemon") probe = false;
+        else if (arg == "--debug") debug = true;
         else if (arg == "--session") session = next("--session");
         else if (arg == "--server") server_cmd = next("--server");
+        else if (arg == "--fifo") fifo = next("--fifo");
         else if (arg == "--file") file = next("--file");
         else if (arg == "--line") line = std::stoi(next("--line"));
         else if (arg == "--col") col = std::stoi(next("--col"));
@@ -153,10 +157,18 @@ int main(int argc, char** argv)
             return run_probe(server_cmd, file, line, col);
         }
 
-        // Daemon mode (Kakoune integration) is the next milestone.
-        (void)session;
-        std::cerr << "daemon mode is not implemented yet; use --probe\n";
-        return 1;
+        // Daemon mode: Kakoune integration.
+        if (session.empty())
+        {
+            std::cerr << "--daemon requires --session <name>\n";
+            return 2;
+        }
+        if (fifo.empty())
+        {
+            const char* dir = std::getenv("TMPDIR");
+            fifo = std::string{dir and *dir ? dir : "/tmp"} + "/kakoune-lsp-cpp-" + session + ".fifo";
+        }
+        return run_daemon(session, fifo, debug);
     }
     catch (const std::exception& e)
     {

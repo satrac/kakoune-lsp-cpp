@@ -13,7 +13,9 @@ find_package(Threads REQUIRED)
 
 add_executable(kakoune-lsp-cpp
   src/main.cc
-  src/lsp.cc)
+  src/lsp.cc
+  src/kak.cc
+  src/daemon.cc)
 target_include_directories(kakoune-lsp-cpp PRIVATE third_party)
 target_compile_definitions(kakoune-lsp-cpp PRIVATE KLSP_VERSION="0.1.0")
 target_link_libraries(kakoune-lsp-cpp PRIVATE Threads::Threads)
